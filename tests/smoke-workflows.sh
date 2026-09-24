@@ -132,6 +132,11 @@ watched=$(rpc sync_pull_watched_items '{"p_profile_id":1,"p_page":1,"p_page_size
 printf '%s' "$watched" | jq -e '.[] | select(.content_id == "tt-smoke-progress")' >/dev/null
 echo "OK  watch progress and watched-items sync"
 
+rpc sync_push_watched_items '{"p_items":[{"content_id":"tt-smoke-series","content_type":"series","title":"Smoke Series","season":1,"episode":1,"watched_at":1760000001000},{"content_id":"tt-smoke-series","content_type":"series","title":"Smoke Series","season":1,"episode":2,"watched_at":1760000002000}],"p_profile_id":1,"p_origin_client_id":"selfhost-smoke"}' >/dev/null
+watched_grouped=$(rpc sync_pull_watched_items_grouped '{"p_profile_id":1,"p_page":1,"p_page_size":1}')
+printf '%s' "$watched_grouped" | jq -e '.[0].content_id == "tt-smoke-series" and .[0].season == 1 and .[0].episode == 2 and .[0].episode_count == 2' >/dev/null
+echo "OK  watched-items grouped by series across pages"
+
 account_backup=$(rpc sync_export_account_backup '{}')
 printf '%s' "$account_backup" | jq -e '.format == "nuvio_account_backup" and .version == 1 and .counts.profiles == 1 and .counts.library_items == 1' >/dev/null
 echo "OK  account export"
