@@ -137,6 +137,18 @@ watched_grouped=$(rpc sync_pull_watched_items_grouped '{"p_profile_id":1,"p_page
 printf '%s' "$watched_grouped" | jq -e '.[0].content_id == "tt-smoke-series" and .[0].season == 1 and .[0].episode == 2 and .[0].episode_count == 2' >/dev/null
 echo "OK  watched-items grouped by series across pages"
 
+resolve_response=$(curl --fail-with-body -sS \
+    -X POST \
+    -H "apikey: $anon_key" \
+    -H "Authorization: Bearer $access_token" \
+    -H "Content-Type: application/json" \
+    --data '{"items":[{"id":"tt-smoke-library","type":"movie"},{"id":"tt-smoke-unresolvable","type":"movie"}],"profile_id":1}' \
+    "$public_url/functions/v1/resolve-metadata")
+printf '%s' "$resolve_response" | jq -e '.items | length == 2' >/dev/null
+printf '%s' "$resolve_response" | jq -e '.items[] | select(.id == "tt-smoke-library") | .name == "Smoke Movie" and .poster == "https://example.com/poster.jpg"' >/dev/null
+printf '%s' "$resolve_response" | jq -e '.items[] | select(.id == "tt-smoke-unresolvable") | .name == null' >/dev/null
+echo "OK  resolve-metadata"
+
 account_backup=$(rpc sync_export_account_backup '{}')
 printf '%s' "$account_backup" | jq -e '.format == "nuvio_account_backup" and .version == 1 and .counts.profiles == 1 and .counts.library_items == 1' >/dev/null
 echo "OK  account export"

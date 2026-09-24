@@ -265,6 +265,7 @@ authenticates itself.
 | `delete-account` | POST, OPTIONS | `Authorization: Bearer <user JWT>` | none | `{success: true}` or `{error}` | Verifies the caller, then uses a service-role client to delete the account (`auth.admin.deleteUser`); cascades via DB triggers. |
 | `tv-logins-exchange` | POST, OPTIONS | one-time TV login code (no bearer from the caller) | `{code, device_nonce}` | `{access_token, refresh_token, token_type, expires_in}` or `{error}` | Second step of TV sign-in: consumes an approved pairing session and mints a real session for the TV, without the TV ever seeing a password. |
 | `tracker-tv-logins-exchange` | POST, OPTIONS | phone's user JWT (must own the pairing session) | `{code, tracker: "mal"\|"anilist"\|"kitsu", access_token, refresh_token?, expires_in?, tracker_user_id?, username?}` | `{ok: true}` or `{error, detail?}` | Phone relays tracker OAuth tokens after completing OAuth, so the TV's poll RPC can pick them up. |
+| `resolve-metadata` | POST, OPTIONS | `Authorization: Bearer <user JWT>` | `{items: [{id, type}, ...], profile_id?: number}` | `{items: [{id, type, name: string\|null, poster: string\|null}, ...]}` | Resolves display name/poster for a batch of content ids — `sync_pull_watch_progress`/`sync_pull_watched_items` return only ids, no titles or artwork. Looks in the caller's `library_items`, then a shared `metadata_cache` table, then the profile's enabled addons (whichever advertise a `meta` resource for the item's type), then falls back to Cinemeta. Unresolved items come back with `name`/`poster` as `null` rather than being omitted, so the response array always matches the request 1:1. Newly resolved items are cached in `metadata_cache` for future requests. Added alongside migration `00000000000012`. |
 
 All functions set permissive CORS (`Access-Control-Allow-Origin: *`).
 
@@ -304,3 +305,11 @@ let the user supply a custom `avatar_url` via `sync_patch_profile`.
   intentional for client-sync fidelity. Use
   `sync_pull_watched_items_grouped` (self-hosted-only, added in migration
   `00000000000011`) for a grouped watch-history UI instead.
+- `sync_pull_watch_progress` and `sync_pull_watched_items` only return
+  `content_id`/`content_type` (and season/episode), not a display name or
+  poster — the hosted dashboard resolved those in its own Next.js server
+  route. Self-hosted has no equivalent server route, so use the
+  `resolve-metadata` edge function (§5, added alongside migration
+  `00000000000012`) to look up names/posters for a batch of ids instead of
+  querying addons directly from the browser (which runs into per-addon CORS
+  restrictions and issues many requests).
