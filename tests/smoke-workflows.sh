@@ -137,6 +137,25 @@ watched_grouped=$(rpc sync_pull_watched_items_grouped '{"p_profile_id":1,"p_page
 printf '%s' "$watched_grouped" | jq -e '.[0].content_id == "tt-smoke-series" and .[0].season == 1 and .[0].episode == 2 and .[0].episode_count == 2' >/dev/null
 echo "OK  watched-items grouped by series across pages"
 
+# Rewatching episode 1 after episode 2 must not make it display as the
+# show's progress: furthest_season/furthest_episode/furthest_watched_at
+# should still report the furthest-along episode (S1E2), while
+# season/episode report the rewatch (S1E1) and watched_at (last activity)
+# moves to the rewatch's timestamp.
+rpc sync_push_watched_items '{"p_items":[{"content_id":"tt-smoke-series","content_type":"series","title":"Smoke Series","season":1,"episode":1,"watched_at":1760000003000}],"p_profile_id":1,"p_origin_client_id":"selfhost-smoke"}' >/dev/null
+watched_grouped_rewatch=$(rpc sync_pull_watched_items_grouped '{"p_profile_id":1,"p_page":1,"p_page_size":1}')
+printf '%s' "$watched_grouped_rewatch" | jq -e '
+    .[0].content_id == "tt-smoke-series"
+    and .[0].season == 1
+    and .[0].episode == 1
+    and .[0].watched_at == 1760000003000
+    and .[0].furthest_season == 1
+    and .[0].furthest_episode == 2
+    and .[0].furthest_watched_at == 1760000002000
+    and .[0].episode_count == 2
+' >/dev/null
+echo "OK  watched-items grouped keeps furthest-along episode after a rewatch"
+
 resolve_response=$(curl --fail-with-body -sS \
     -X POST \
     -H "apikey: $anon_key" \
