@@ -37,6 +37,24 @@ env_value() {
     grep "^$1=" .env | head -n 1 | cut -d= -f2-
 }
 
+# Pull registry images, skipping the dashboard when NUVIO_ACCOUNT_DASHBOARD_IMAGE
+# points at a locally built image (e.g. transferred with docker save/load).
+pull_images() {
+    dashboard_image=$(env_value NUVIO_ACCOUNT_DASHBOARD_IMAGE)
+    default_dashboard_image=ghcr.io/nuviomedia/nuvio-account-dashboard
+    case "$dashboard_image" in
+        ""|"$default_dashboard_image"*) docker compose pull; return ;;
+    esac
+    if ! docker image inspect "$dashboard_image" >/dev/null 2>&1; then
+        docker compose pull
+        return
+    fi
+    echo "Skipping account-dashboard: using local image $dashboard_image"
+    services=$(docker compose config --services | grep -vx account-dashboard)
+    # shellcheck disable=SC2086
+    docker compose pull $services
+}
+
 active_profiles() {
     if [ "${COMPOSE_PROFILES+x}" = "x" ]; then
         printf '%s\n' "$COMPOSE_PROFILES"
@@ -904,7 +922,7 @@ case "$command" in
     import-account) import_account "$@" ;;
     backup) backup ;;
     restore) restore "$@" ;;
-    pull) require_env; require_docker; docker compose pull ;;
+    pull) require_env; require_docker; pull_images ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 1 ;;
 esac
