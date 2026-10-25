@@ -2,7 +2,7 @@
 
 This document catalogues every endpoint this backend exposes, for building a
 client (such as a replacement account dashboard) against it. It reflects the
-schema as of migration `00000000000014`.
+schema as of migration `00000000000015`.
 
 The backend is a self-hosted Supabase-style stack: Kong gateway in front of
 PostgREST, GoTrue auth, Storage, and a set of Deno edge functions. There is
@@ -132,7 +132,7 @@ Functions granted to `anon` (usable without signing in first):
 
 | Function | Params | Returns | Notes |
 | --- | --- | --- | --- |
-| `sync_pull_library(p_profile_id integer DEFAULT 1, p_limit integer DEFAULT 500, p_offset integer DEFAULT 0)` | `SETOF library_items` | Ordered by `added_at DESC`. Rows include an optional `logo` URL (added in migration `00000000000014`; accepted by the library push RPCs and returned by the delta feed). |
+| `sync_pull_library(p_profile_id integer DEFAULT 1, p_limit integer DEFAULT 500, p_offset integer DEFAULT 0)` | `SETOF library_items` | Ordered by `added_at DESC, id` (stable offset paging; tiebreaker added in migration `00000000000015`). Rows include an optional `logo` URL (added in migration `00000000000014`; accepted by the library push RPCs and returned by the delta feed). |
 | `sync_pull_library_delta(p_profile_id integer DEFAULT 1, p_since_event_id bigint DEFAULT 0, p_limit integer DEFAULT 1000)` | `TABLE(event_id, operation, content_id, content_type, name, poster, poster_shape, background, description, release_info, imdb_rating, genres, addon_base_url, added_at, logo)` | Incremental feed; `operation` is `upsert`/`delete`. `p_limit` clamped 1-1000. |
 | `sync_get_library_delta_cursor(p_profile_id integer DEFAULT 1)` | → `bigint` | Latest `event_id`, for bootstrapping delta polling. |
 | `sync_push_library_items(p_items jsonb, p_profile_id integer DEFAULT 1, p_origin_client_id text DEFAULT NULL)` | → `void` | **Preferred push RPC** (item-level upsert). |
@@ -152,7 +152,7 @@ Functions granted to `anon` (usable without signing in first):
 
 | Function | Params | Returns | Notes |
 | --- | --- | --- | --- |
-| `sync_pull_watched_items(p_profile_id integer DEFAULT 1, p_page integer DEFAULT 1, p_page_size integer DEFAULT 100000)` | `SETOF watched_items` | Raw per-episode rows, `watched_at DESC`, plain offset pagination. **Use this for full local sync** (e.g. mobile/TV clients replicating exact per-episode state) — it does not group by series, so a series' episodes can appear on different pages. |
+| `sync_pull_watched_items(p_profile_id integer DEFAULT 1, p_page integer DEFAULT 1, p_page_size integer DEFAULT 100000)` | `SETOF watched_items` | Raw per-episode rows, `watched_at DESC, id` (the `id` tiebreaker, added in migration `00000000000015`, keeps offset pages free of repeats and gaps when rows share a timestamp), plain offset pagination. **Use this for full local sync** (e.g. mobile/TV clients replicating exact per-episode state) — it does not group by series, so a series' episodes can appear on different pages. |
 | `sync_pull_watched_items_grouped(p_profile_id integer DEFAULT 1, p_page integer DEFAULT 1, p_page_size integer DEFAULT 50)` | `TABLE(content_id text, content_type text, title text, season integer, episode integer, watched_at bigint, furthest_season integer, furthest_episode integer, furthest_watched_at bigint, episode_count integer)` | **Use this for a history/"watched" UI list.** One row per `content_id` (movie or series), with two independent episode pointers: `season`/`episode`/`watched_at` describe the episode tied to the most recent watch activity — the actual last-watched episode, which may be an *earlier* episode than the show's progress if it was rewatched — use this for "last watched S1E1 on \<date\>" UI. `watched_at` is `max(watched_at)` across the whole group ("last activity on this title") and is what pagination/ordering use. `furthest_season`/`furthest_episode`/`furthest_watched_at` describe the *furthest-along* watched entry in the group (highest season, then highest episode) — use this for "continue watching S3E26" UI. `title`/`content_type` come from the most-recently-watched row. `episode_count` is the number of distinct watched episodes in the group, or `NULL` for movies/items with no episode data. Paginated over groups, so a series can never be split across pages, and results are already in reverse-chronological order by most recent activity. Added in migration `00000000000011`; the furthest-along/last-watched split (`furthest_season`, `furthest_episode`, `furthest_watched_at`) added in migration `00000000000013`. |
 | `sync_pull_watched_items_delta(p_profile_id integer DEFAULT 1, p_since_event_id bigint DEFAULT 0, p_limit integer DEFAULT 1000)` | `TABLE(event_id, operation, content_id, content_type, title, season, episode, watched_at)` | Delta feed of raw rows. |
 | `sync_get_watched_items_delta_cursor(p_profile_id integer DEFAULT 1)` | → `bigint` | |
@@ -287,6 +287,82 @@ authenticates itself.
 | `resolve-metadata` | POST, OPTIONS | `Authorization: Bearer <user JWT>` | `{items: [{id, type}, ...], profile_id?: number}` | `{items: [{id, type, name: string\|null, poster: string\|null}, ...]}` | Resolves display name/poster for a batch of content ids — `sync_pull_watch_progress`/`sync_pull_watched_items` return only ids, no titles or artwork. Looks in the caller's `library_items`, then a shared `metadata_cache` table, then the profile's enabled addons (whichever advertise a `meta` resource for the item's type), then falls back to Cinemeta. Unresolved items come back with `name`/`poster` as `null` rather than being omitted, so the response array always matches the request 1:1. Newly resolved items are cached in `metadata_cache` for future requests. Added alongside migration `00000000000012`. |
 
 All functions set permissive CORS (`Access-Control-Allow-Origin: *`).
+
+## 5a. Nuvio Mobile compatibility
+
+Nuvio Mobile documents the sync surface it uses in its own
+`Docs/SYNC_BACKEND_API.md`. This backend implements all of it. The tables below
+map the app's calls to this document and list the behaviours that matter when
+building or testing against it. `tests/smoke-mobile-sync.sh` replays the app's
+request shapes and runs in CI.
+
+### Conventions the app relies on
+
+- **Parameters** are named `p_*`. Zero-argument RPCs (`sync_pull_profiles`,
+  `sync_pull_profile_locks`, `get_avatar_catalog`) are sent with no body.
+- **`p_origin_client_id`** is `nuvio-mobile-` plus 32 random characters
+  (16-96 characters of `[A-Za-z0-9_-]`) and is also the `p_installation_id`
+  for `register_current_device` (client name `Nuvio Mobile`). It is optional on
+  every function that accepts it, and `sync_push_plugins` is called without it.
+  The app does not filter pulls by it.
+- **Platform keys:** the settings blob uses `p_platform: "mobile"`; home catalog
+  settings use the shared `home_catalog_shared` key. TV colour normalisation
+  applies only to `platform = 'tv'`, so mobile blobs are stored verbatim.
+- **Writes:** addons, plugins, provider credentials and media servers are full
+  replacements. The settings blob, collections and home catalog settings are
+  last-write-wins and stored as given (unknown keys survive). Profile push is an
+  upsert and never deletes; deletion uses `sync_delete_profile_data`.
+- **Credentials:** the app pushes a snapshot of every provider, empty values
+  included, and clears a local key when no row comes back for it. Every row must
+  hold exactly `{"api_key": <string>}` (`{"client_id": <string>}` for
+  `animeskip`); anything else fails the whole credential sync on the device.
+- **Delta feeds:** the app reads the cursor, then the snapshot, then deltas
+  after the cursor. Library, watch-progress and watched-item delete events carry
+  the identifying key (`content_id`/`content_type`, `progress_key`, or
+  `content_id`/`season`/`episode`). Snapshot pulls page with `OFFSET`: library
+  500 rows, watched items 900 rows (1-based pages), until a short page.
+- **Never return HTTP 401/403 for business errors on sync calls.** The app
+  treats them, and a few error texts (a JWT that is invalid or expired, "user"
+  with "not found"/"does not exist"/"deleted", or a foreign-key error mentioning
+  `auth.users`/`user_id`), as a dead session, signs out and wipes local account
+  data. Conflicts use `PT409` (HTTP 409), validation uses `22023`.
+
+### Call map
+
+| Mobile feature | Calls |
+| --- | --- |
+| Sign-in, device link | GoTrue email/password; `start_device_login_session` (`p_device_type: "mobile"`), `poll_tv_login_session`, `tv-logins-exchange` (§3.2, §5) |
+| Profiles and PIN | `sync_pull_profiles`, `sync_push_profiles`, `sync_delete_profile_data`, `verify_profile_pin`, `set_profile_pin`, `clear_profile_pin`, `clear_profile_pin_with_account_password`, `sync_pull_profile_locks` (§3.3) |
+| Addons, plugins | `GET /rest/v1/addons`, `GET /rest/v1/plugins` (`profile_id=eq.N&order=sort_order.asc`), `sync_push_addons`, `sync_push_plugins` (§3.7) |
+| Settings, credentials | `sync_pull/push_profile_settings_blob` (`mobile`), `sync_pull/push_provider_credentials` (§3.9, §3.11) |
+| Library | `sync_pull_library`, `sync_get_library_delta_cursor`, `sync_pull_library_delta`, `sync_push_library_items`, `sync_delete_library_items` (§3.4) |
+| Watch progress, watched | `sync_pull_watch_progress` and its delta/cursor, `sync_push_watch_progress`, `sync_delete_watch_progress`; `sync_pull_watched_items` and its delta/cursor, `sync_push_watched_items`, `sync_delete_watched_items` (§3.5, §3.6) |
+| Collections, home, servers | `sync_pull/push_collections`, `sync_pull/push_home_catalog_settings` (`home_catalog_shared`), `sync_pull/push_media_servers` (§3.8, §3.10, §3.9a) |
+| Device and account | `register_current_device`, `get_avatar_catalog`, `delete-account` |
+
+### Known differences from the hosted service
+
+- **Watch-progress writes are throttled** (matches the hosted backend). An update
+  to an existing row is stored only if the position moved by at least 15 s,
+  `last_watched` is at least 30 s newer, or it crosses 90 % of the duration. A
+  final "stop" scrobble inside those limits is dropped, so a stored resume
+  position can lag by up to roughly 15-30 s. Older pushes never move progress
+  backwards.
+- **Profile backgrounds are not supported** (§7). `sync_pull_profiles` does not
+  return `profile_background_id`/`profile_background_url` and push ignores them.
+- **Membership and watch-party RPCs are not implemented**
+  (`get_my_member_access`, `get_my_membership_overview`,
+  `get_member_profile_avatar_catalog`, `get_member_profile_background_catalog`,
+  `watch_party_*`). PostgREST answers 404; the app treats that as "no access".
+  `/.well-known/nuvio` omits `capabilities.watch_party`, which the app defaults
+  to `false`.
+- **Device linking needs a `/link` page.** `start_device_login_session` requires
+  the redirect URL to contain `/link`, and the app passes `<backend_url>/link`.
+  That page is served by the account dashboard behind the proxy, not by this
+  repository; `/.well-known/nuvio` advertises `tv_login: true`.
+- **Delta event ids are sequence-assigned**, so concurrent pushes can in rare
+  cases commit out of order. A device may then miss an event until its next full
+  refresh (login, profile switch, or a delta error).
 
 ## 6. Storage
 
