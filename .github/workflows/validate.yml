@@ -37,6 +37,7 @@ jobs:
           sh -n tests/smoke-security.sh
           sh -n tests/smoke-upgrade.sh
           sh -n tests/smoke-workflows.sh
+          sh -n tests/smoke-mobile-sync.sh
       - name: Validate Compose
         run: |
           docker compose config --quiet
@@ -171,6 +172,8 @@ jobs:
         run: ./tests/smoke-discovery.sh
       - name: Verify client workflows
         run: ./tests/smoke-workflows.sh
+      - name: Verify Nuvio Mobile sync contract
+        run: ./tests/smoke-mobile-sync.sh
       - name: Verify API security boundaries
         run: ./tests/smoke-security.sh
       - name: Verify official account import
