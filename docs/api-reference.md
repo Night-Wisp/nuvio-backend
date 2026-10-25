@@ -2,7 +2,7 @@
 
 This document catalogues every endpoint this backend exposes, for building a
 client (such as a replacement account dashboard) against it. It reflects the
-schema as of migration `00000000000011`.
+schema as of migration `00000000000014`.
 
 The backend is a self-hosted Supabase-style stack: Kong gateway in front of
 PostgREST, GoTrue auth, Storage, and a set of Deno edge functions. There is
@@ -107,6 +107,9 @@ Functions granted to `anon` (usable without signing in first):
 | `start_tv_login_session(p_device_nonce text, p_redirect_base_url text, p_device_name text DEFAULT NULL)` | → `TABLE(code text, web_url text, expires_at timestamptz, poll_interval_seconds integer)` | `anon`. Nonce ≥12 chars, redirect URL must contain `/tv-login`. Rate-limited to 200 new sessions/min. 5-minute TTL. |
 | `poll_tv_login_session(p_code text, p_device_nonce text)` | → `TABLE(status text, expires_at timestamptz, poll_interval_seconds integer)` | `anon`. Auto-expires after 240 polls. |
 | `approve_tv_login_session(p_code text)` | → `TABLE(success boolean, message text)` | Requires signed-in session. Returns `(false, ...)` rather than raising on an unknown/expired code. |
+| `start_device_login_session(p_device_nonce text, p_redirect_base_url text, p_device_name text DEFAULT NULL, p_device_type text DEFAULT 'device')` | → `TABLE(device_code text, user_code text, verification_uri text, verification_uri_complete text, expires_at timestamptz, poll_interval_seconds integer)` | `anon`. Short-code device linking, an alternative to the `start_tv_login_session` flow. Nonce ≥12 chars; redirect URL must be http(s), contain `/link`, and have no query string or fragment. `user_code` is the six-character code the device displays; `verification_uri_complete` is the redirect URL with `?code=<user_code>` appended. Rate-limited on new sessions per minute; 5-minute TTL. The device then polls with `poll_tv_login_session(device_code, nonce)` and finishes with the `tv-logins-exchange` edge function, exactly as with the TV flow. Added in migration `00000000000014`. |
+| `get_device_login_session(p_user_code text)` | → `TABLE(success boolean, message text, user_code text, device_name text, device_type text, expires_at timestamptz)` | Requires signed-in session. Looks up a pending session by user code so the approver can confirm which device they are linking. Returns `(false, ...)` rather than raising for an unknown/expired code, but attempts are limited to 5 per user per 5 minutes (raises `Too many device code attempts`). |
+| `approve_device_login_session(p_user_code text)` | → `TABLE(success boolean, message text, device_name text, device_type text)` | Requires signed-in session. Approves the session so the device's poll/exchange succeeds. Shares the attempt limit with `get_device_login_session`. |
 | `start_tracker_tv_login_session(p_tracker text, p_device_nonce text, p_redirect_base_url text)` | → `TABLE(code text, web_url text, expires_at timestamptz, poll_interval_seconds integer)` | `anon`. `p_tracker` in `mal`/`anilist`/`kitsu`. |
 | `poll_tracker_tv_login_session(p_tracker text, p_code text, p_device_nonce text)` | → `TABLE(status text, access_token text, refresh_token text, expires_in integer, user_id text, username text, poll_interval_seconds integer)` | `anon`. `status` is `pending`/`ready`/`expired`. |
 
@@ -115,7 +118,7 @@ Functions granted to `anon` (usable without signing in first):
 | Function | Params | Returns | Notes |
 | --- | --- | --- | --- |
 | `sync_pull_profiles()` | — | `TABLE(id uuid, user_id uuid, profile_index integer, name text, avatar_color_hex text, uses_primary_addons boolean, uses_primary_plugins boolean, avatar_id text, avatar_url text, pin_enabled boolean, pin_locked_until timestamptz, created_at timestamptz, updated_at timestamptz)` | Ordered by `profile_index`. |
-| `sync_push_profiles(p_profiles jsonb, p_client_max_profiles integer, p_origin_client_id text)` | → `void` | Full-array replace. `p_client_max_profiles` must be 1-6. Profile index 1 always has `uses_primary_addons/plugins = false`. |
+| `sync_push_profiles(p_profiles jsonb, p_client_max_profiles integer, p_origin_client_id text)` | → `void` | Upserts the supplied profiles and **does not delete profiles omitted from the array** (use `sync_delete_profile_data` for explicit deletion). `p_client_max_profiles` must be 1-6. Profile index 1 always has `uses_primary_addons/plugins = false`. |
 | `sync_patch_profile(p_profile_id integer, p_name text DEFAULT NULL, p_avatar_color_hex text DEFAULT NULL, p_uses_primary_addons boolean DEFAULT NULL, p_uses_primary_plugins boolean DEFAULT NULL, p_avatar_url text DEFAULT NULL, p_avatar_url_provided boolean DEFAULT false, p_avatar_id text DEFAULT NULL, p_avatar_id_provided boolean DEFAULT false, p_profile_background_id text DEFAULT NULL, p_profile_background_id_provided boolean DEFAULT false, p_profile_background_url text DEFAULT NULL, p_profile_background_url_provided boolean DEFAULT false)` | `TABLE(id, user_id, profile_index, name, avatar_color_hex, uses_primary_addons, uses_primary_plugins, avatar_id, avatar_url, profile_background_id, profile_background_url, created_at, updated_at)` | **Preferred way to edit a single profile.** Sparse patch — only fields whose `*_provided` flag is true are changed. See §7 for the profile-background caveat. |
 | `sync_delete_profile_data(p_profile_id integer, p_origin_client_id text)` | → `void` | Deletes the profile and all profile-scoped data (addons, plugins, collections, settings, watch progress, watched items, tracker data, audit/event logs). |
 | `sync_pull_profile_locks()` | — | `TABLE(profile_index integer, pin_enabled boolean, pin_locked_until timestamptz)` | Lightweight PIN-lock status for rendering locked profile tiles. |
@@ -129,8 +132,8 @@ Functions granted to `anon` (usable without signing in first):
 
 | Function | Params | Returns | Notes |
 | --- | --- | --- | --- |
-| `sync_pull_library(p_profile_id integer DEFAULT 1, p_limit integer DEFAULT 500, p_offset integer DEFAULT 0)` | `SETOF library_items` | Ordered by `added_at DESC`. |
-| `sync_pull_library_delta(p_profile_id integer DEFAULT 1, p_since_event_id bigint DEFAULT 0, p_limit integer DEFAULT 1000)` | `TABLE(event_id, operation, content_id, content_type, name, poster, poster_shape, background, description, release_info, imdb_rating, genres, addon_base_url, added_at)` | Incremental feed; `operation` is `upsert`/`delete`. `p_limit` clamped 1-1000. |
+| `sync_pull_library(p_profile_id integer DEFAULT 1, p_limit integer DEFAULT 500, p_offset integer DEFAULT 0)` | `SETOF library_items` | Ordered by `added_at DESC`. Rows include an optional `logo` URL (added in migration `00000000000014`; accepted by the library push RPCs and returned by the delta feed). |
+| `sync_pull_library_delta(p_profile_id integer DEFAULT 1, p_since_event_id bigint DEFAULT 0, p_limit integer DEFAULT 1000)` | `TABLE(event_id, operation, content_id, content_type, name, poster, poster_shape, background, description, release_info, imdb_rating, genres, addon_base_url, added_at, logo)` | Incremental feed; `operation` is `upsert`/`delete`. `p_limit` clamped 1-1000. |
 | `sync_get_library_delta_cursor(p_profile_id integer DEFAULT 1)` | → `bigint` | Latest `event_id`, for bootstrapping delta polling. |
 | `sync_push_library_items(p_items jsonb, p_profile_id integer DEFAULT 1, p_origin_client_id text DEFAULT NULL)` | → `void` | **Preferred push RPC** (item-level upsert). |
 | `sync_delete_library_items(p_keys jsonb, p_profile_id integer DEFAULT 1, p_origin_client_id text DEFAULT NULL)` | → `void` | Deletes by array of `{content_id, content_type}`. |
@@ -142,7 +145,7 @@ Functions granted to `anon` (usable without signing in first):
 | `sync_pull_watch_progress(p_profile_id integer DEFAULT 1, p_since_last_watched bigint DEFAULT NULL, p_limit integer DEFAULT NULL)` | `SETOF watch_progress` | Ordered by `last_watched DESC`. |
 | `sync_pull_watch_progress_delta(p_profile_id integer DEFAULT 1, p_since_event_id bigint DEFAULT 0, p_limit integer DEFAULT 1000)` | `TABLE(event_id, operation, progress_key, content_id, content_type, video_id, season, episode, position, duration, last_watched)` | Delta feed. |
 | `sync_get_watch_progress_delta_cursor(p_profile_id integer DEFAULT 1)` | → `bigint` | |
-| `sync_push_watch_progress(p_entries jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Batch upsert. Crossing a completion threshold automatically creates/updates a corresponding `watched_items` row. |
+| `sync_push_watch_progress(p_entries jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Batch upsert. Crossing a completion threshold automatically creates/updates a corresponding `watched_items` row. Stale pushes are ignored: an older entry will not move progress backwards, resurrect progress another device removed, or reopen an item marked watched after the pushed position. |
 | `sync_delete_watch_progress(p_keys jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Deletes by `progress_key` array. |
 
 ### 3.6 Watched items (history)
@@ -180,7 +183,19 @@ see §4), or use `sync_export_account_backup`.
 | --- | --- | --- | --- |
 | `sync_pull_profile_settings_blob(p_profile_id integer, p_platform text DEFAULT 'tv')` | `TABLE(profile_id integer, settings_json jsonb, updated_at timestamptz)` | |
 | `sync_push_profile_settings_blob(p_profile_id integer, p_settings_json jsonb, p_platform text, p_origin_client_id text)` | → `void` | Blind overwrite, no concurrency guard. |
-| `sync_push_profile_settings_blob_guarded(p_profile_id integer, p_settings_json jsonb, p_platform text, p_expected_updated_at timestamptz)` | → `timestamptz` | **Preferred write path for a dashboard.** Optimistic concurrency: `p_expected_updated_at` must match the row's current `updated_at` (or be `NULL` if no row exists yet), else raises `40001 Settings changed on another device. Reload and try again.`. Returns the new `updated_at` to re-arm the guard. |
+| `sync_push_profile_settings_blob_guarded(p_profile_id integer, p_settings_json jsonb, p_platform text, p_expected_updated_at timestamptz)` | → `timestamptz` | **Preferred write path for a dashboard.** Optimistic concurrency: `p_expected_updated_at` must match the row's current `updated_at` (or be `NULL` if no row exists yet), else raises `PT409 Settings changed on another device. Reload and try again.`, which PostgREST returns as **HTTP 409** (it is not a retried `40001`). Returns the new `updated_at` to re-arm the guard. For the `tv` platform, `features.player_settings.subtitle_{text,background,outline}_color` values are normalized server-side to signed 32-bit ARGB ints (e.g. `{"type":"int","value":-1}`). |
+
+### 3.9a Media servers
+
+| Function | Params | Returns | Notes |
+| --- | --- | --- | --- |
+| `sync_pull_media_servers(p_profile_id integer)` | `TABLE(servers_json jsonb, updated_at timestamptz)` | Zero or one row. `servers_json` is an array of server objects (`id`, `provider_id`, `name`, `address`, `remote_server_id`, `remote_user_id`, `user_name`, `token`, `enabled`, `use_catalog_metadata`, `libraries[]`). Profile id 1-6. |
+| `sync_push_media_servers(p_profile_id integer, p_servers jsonb, p_origin_client_id text)` | → `timestamptz` | Replaces the profile's server list. At most 16 servers (duplicate ids rejected) and 500 libraries per server; fields are trimmed and length-checked. Returns the new `updated_at`. |
+
+Server entries include access tokens, so `media_servers` has no table grants for
+`anon`/`authenticated` and is RPC-only. Rows are removed by
+`sync_delete_profile_data` and account deletion. Added in migration
+`00000000000014`.
 
 ### 3.10 Collections
 
@@ -249,6 +264,10 @@ Exceptions worth knowing:
   `tracker-tv-logins-exchange` edge function).
 - `provider_credentials` — has RLS but no table grant to `anon`/`authenticated`,
   so it's unreachable via REST; RPC-only.
+- `media_servers`, `device_login_code_attempts` — no table grants for
+  `anon`/`authenticated`; RPC-only (`media_servers` holds access tokens).
+- `metadata_cache` — shared name/poster cache for `resolve-metadata`; RLS on,
+  service-role access only.
 - `library_item_events`, `watch_progress_events`, `watched_item_events`,
   `user_activity_events`, `sync_push_audit_logs` — internal delta/audit logs,
   effectively locked down; use the `sync_pull_*_delta` RPCs instead.
