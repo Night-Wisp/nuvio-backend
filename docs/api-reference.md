@@ -2,7 +2,7 @@
 
 This document catalogues every endpoint this backend exposes, for building a
 client (such as a replacement account dashboard) against it. It reflects the
-schema as of migration `00000000000015`.
+schema as of migration `00000000000016`.
 
 The backend is a self-hosted Supabase-style stack: Kong gateway in front of
 PostgREST, GoTrue auth, Storage, and a set of Deno edge functions. There is
@@ -120,7 +120,8 @@ Functions granted to `anon` (usable without signing in first):
 | `sync_pull_profiles()` | — | `TABLE(id uuid, user_id uuid, profile_index integer, name text, avatar_color_hex text, uses_primary_addons boolean, uses_primary_plugins boolean, avatar_id text, avatar_url text, pin_enabled boolean, pin_locked_until timestamptz, created_at timestamptz, updated_at timestamptz)` | Ordered by `profile_index`. |
 | `sync_push_profiles(p_profiles jsonb, p_client_max_profiles integer, p_origin_client_id text)` | → `void` | Upserts the supplied profiles and **does not delete profiles omitted from the array** (use `sync_delete_profile_data` for explicit deletion). `p_client_max_profiles` must be 1-6. Profile index 1 always has `uses_primary_addons/plugins = false`. |
 | `sync_patch_profile(p_profile_id integer, p_name text DEFAULT NULL, p_avatar_color_hex text DEFAULT NULL, p_uses_primary_addons boolean DEFAULT NULL, p_uses_primary_plugins boolean DEFAULT NULL, p_avatar_url text DEFAULT NULL, p_avatar_url_provided boolean DEFAULT false, p_avatar_id text DEFAULT NULL, p_avatar_id_provided boolean DEFAULT false, p_profile_background_id text DEFAULT NULL, p_profile_background_id_provided boolean DEFAULT false, p_profile_background_url text DEFAULT NULL, p_profile_background_url_provided boolean DEFAULT false)` | `TABLE(id, user_id, profile_index, name, avatar_color_hex, uses_primary_addons, uses_primary_plugins, avatar_id, avatar_url, profile_background_id, profile_background_url, created_at, updated_at)` | **Preferred way to edit a single profile.** Sparse patch — only fields whose `*_provided` flag is true are changed. See §7 for the profile-background caveat. |
-| `sync_delete_profile_data(p_profile_id integer, p_origin_client_id text)` | → `void` | Deletes the profile and all profile-scoped data (addons, plugins, collections, settings, watch progress, watched items, tracker data, audit/event logs). |
+| `sync_delete_profile_data(p_profile_id integer, p_origin_client_id text)` | → `void` | Deletes the profile and all profile-scoped data (addons, plugins, collections, settings, watch progress, watched items, tracker data, audit logs). The watch-progress, watched-item and library delta events are **kept**, including the delete events the removal emits, so other devices holding a cursor learn about the deletions (migration `00000000000016`). Account deletion still removes them. |
+| `sync_copy_profile_setup(p_source_profile_id integer, p_target_profile_id integer, p_copy_tv boolean DEFAULT true, p_copy_mobile boolean DEFAULT false, p_copy_desktop boolean DEFAULT false, p_copy_provider_credentials boolean DEFAULT false, p_replace_provider_credentials boolean DEFAULT false, p_origin_client_id text DEFAULT NULL)` | `TABLE(source_profile_id integer, target_profile_id integer, tv_status text, mobile_status text, desktop_status text, provider_credentials_status text)` | Copies the per-platform settings blobs and, optionally, the provider credentials from one profile to another. Both profiles must already exist (profile ids 1-6, source ≠ target), otherwise it raises `22023`. `*_status` is `copied` or `unchanged` (also `unchanged` when the platform was not requested or the source has no blob). `provider_credentials_status` is `copied`, `copied_partial` (some rows copied, some kept), `kept_existing` (target rows differ and `p_replace_provider_credentials` is false), `unchanged` or `source_missing`. Nuvio TV validates these values. Added in migration `00000000000016`. |
 | `sync_pull_profile_locks()` | — | `TABLE(profile_index integer, pin_enabled boolean, pin_locked_until timestamptz)` | Lightweight PIN-lock status for rendering locked profile tiles. |
 | `set_profile_pin(p_profile_id integer, p_pin text, p_current_pin text DEFAULT NULL)` | → `void` | PIN must be exactly 4 digits. `p_current_pin` required if a PIN is already set. |
 | `clear_profile_pin(p_profile_id integer, p_current_pin text DEFAULT NULL)` | → `void` | Requires current PIN. |
@@ -163,8 +164,8 @@ Functions granted to `anon` (usable without signing in first):
 
 | Function | Params | Returns | Notes |
 | --- | --- | --- | --- |
-| `sync_push_addons(p_addons jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Full replace per profile, hash-diffed to skip no-op writes. |
-| `sync_push_plugins(p_plugins jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Same pattern. |
+| `sync_push_addons(p_addons jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Full replace per profile, hash-diffed to skip no-op writes. If a URL appears more than once in the payload the last entry wins (migration `00000000000016`; earlier versions rejected the whole push). |
+| `sync_push_plugins(p_plugins jsonb, p_profile_id integer, p_origin_client_id text)` | → `void` | Same pattern, including the repeated-URL rule. |
 
 There is no dedicated `sync_pull_addons`/`sync_pull_plugins` RPC — read the
 `addons`/`plugins` tables directly via PostgREST (RLS-scoped to the caller;
@@ -360,9 +361,54 @@ request shapes and runs in CI.
   the redirect URL to contain `/link`, and the app passes `<backend_url>/link`.
   That page is served by the account dashboard behind the proxy, not by this
   repository; `/.well-known/nuvio` advertises `tv_login: true`.
-- **Delta event ids are sequence-assigned**, so concurrent pushes can in rare
-  cases commit out of order. A device may then miss an event until its next full
-  refresh (login, profile switch, or a delta error).
+- **Delta event ids are assigned in commit order per account.** Event inserts
+  take a per-account advisory lock before drawing the id (migration
+  `00000000000016`), so a device that pulls between two concurrent pushes cannot
+  move its cursor past an event that has not committed yet. Ids may have gaps.
+
+## 5b. Nuvio TV compatibility
+
+Nuvio TV documents the sync protocol it speaks in `docs/sync.md` of the
+`nuvio-tv` repository. That document describes the server partly from inference,
+so where it disagrees with this reference, this backend is the source of truth.
+`tests/smoke-tv-sync.sh` replays the TV request shapes that changed in migration
+`00000000000016` and runs in CI.
+
+### Known differences from the TV sync document
+
+- **Account linking (sync codes) is not implemented.** `generate_sync_code`,
+  `get_sync_code`, `claim_sync_code`, `unlink_device`, the `linked_devices` table
+  and a linked-device-aware `get_sync_owner()` do not exist. `get_sync_owner()`
+  returns the caller's own id. The TV's sync-code and linked-devices screens get
+  404s, and a second sign-in cannot read another account's data. Several devices
+  signed in to the same account sync normally.
+- **`sync_pull_watch_progress` snapshots are capped by `PGRST_DB_MAX_ROWS`**
+  (default `1000`, set in `compose.yml` and `.env.example`). The TV's snapshot
+  pull sends no `p_limit` and expects every row, but PostgREST truncates RPC
+  results at that cap without an error. An account with more than 1000
+  watch-progress rows (episodes plus series entries) loses the oldest resume
+  entries on the first sync and on the TV's 6-hourly full pull. Raise
+  `PGRST_DB_MAX_ROWS` if accounts on this instance hold that many rows. The
+  delta feeds and the 900- and 500-row paged pulls for watched items and the
+  library are not affected.
+- **Watch-progress pushes are filtered** (see §5a for the throttle). A BEFORE
+  trigger also rewrites `progress_key` to `<content_id>_s<season>e<episode>` for
+  episodes and to `<content_id>` otherwise, so a series-level entry that carries
+  a season and episode is stored on the episode's row. The TV drops those
+  entries from its pushes whenever the episode entry is at least as fresh.
+- **New accounts and profiles are seeded with default addons** that carry a
+  `name`, which the TV reads as a user rename.
+- **`sync_push_profiles` never deletes profiles** (§3.3), and profile 1 can be
+  deleted with `sync_delete_profile_data`.
+- **Profile backgrounds, membership and watch-party RPCs are not supported**
+  (§5a, §7). The TV treats the missing RPCs as "no access".
+- **`poll_tv_login_session` can return `exchanged`** after a successful token
+  exchange. The TV never polls past the exchange, and it shows unknown statuses
+  as text. An approved session past its expiry still polls as `approved`, and the
+  exchange then fails, because the code is consumed before tokens are minted;
+  the TV has to start a new login. New-session rate limiting raises HTTP 400
+  rather than 429, and `register_current_device` raises 403 when the JWT has no
+  matching session; the TV logs and ignores that failure.
 
 ## 6. Storage
 
